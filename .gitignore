@@ -1,0 +1,13 @@
+.env
+logs/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+dashboard/node_modules/
+dashboard/dist/
+.vscode/
+bot_state.json
+trades.json
+rl_state.json
