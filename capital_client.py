@@ -241,13 +241,17 @@ class CapitalClient:
     def get_positions(self) -> Optional[dict]:
         return self._get("/positions")
 
+    def confirm_deal(self, deal_reference: str) -> Optional[dict]:
+        """GET /confirms/{dealReference} – returns the deal confirmation status from Capital.com."""
+        return self._get(f"/confirms/{deal_reference}")
+
     def open_position(
         self,
         epic: str,
         direction: str,
         size: float,
         stop_level: float,
-        profit_level: float,
+        profit_level: Optional[float] = None,
     ) -> tuple[Optional[dict], int]:
         body = {
             "direction": direction,        # "BUY" or "SELL"
@@ -255,9 +259,13 @@ class CapitalClient:
             "size": size,
             "guaranteedStop": False,
             "stopLevel": round(stop_level, 5),
-            "profitLevel": round(profit_level, 5),
         }
-        return self._post("/positions", body)
+        if profit_level is not None:
+            body["profitLevel"] = round(profit_level, 5)
+        logger.info("POST /positions body: %s", body)
+        result, status = self._post("/positions", body)
+        logger.info("POST /positions response: status=%s body=%s", status, result)
+        return result, status
 
     def close_position(self, deal_id: str) -> tuple[Optional[dict], int]:
         return self._delete(f"/positions/{deal_id}")

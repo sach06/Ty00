@@ -9,9 +9,9 @@ SHORT : RSI crosses above 70  AND  close touches or breaks above upper BB
 Exit rules (handled by the trading loop, not here)
 -----------
 - Stop loss   : entry ± 1.5 × ATR(14)
-- Take profit : entry ± 3.0 × ATR(14)  (= 2 : 1 R/R)
+- Trailing SL : armed once price reaches +0.5R, then trails by 0.5R
 - Time stop   : 4 hours (hard limit, set in config)
-- SL/TP are submitted as order levels to Capital.com at trade open
+- Initial SL is submitted at trade open; the trading loop manages the trailing stop
 
 All indicators computed with pure pandas/numpy – no extra libraries required.
 """
@@ -36,6 +36,42 @@ class Signal:
     atr: float
     rsi: float
     reason: str
+
+
+def update_trailing_stop(
+    direction: str,
+    entry_price: float,
+    initial_stop: float,
+    current_stop: float,
+    best_price: float,
+    current_price: float,
+    arm_r: float = 0.5,
+    trail_gap_r: float = 0.5,
+) -> tuple[float, float]:
+    """Return the updated stop and best favorable price for a monotonic trailing stop."""
+    risk_distance = abs(entry_price - initial_stop)
+    if risk_distance <= 0:
+        return current_stop, best_price
+
+    if direction == "BUY":
+        best_favorable = max(best_price, current_price)
+        profit_distance = best_favorable - entry_price
+        if profit_distance < arm_r * risk_distance:
+            return current_stop, best_favorable
+        trailing_candidate = best_favorable - trail_gap_r * risk_distance
+        new_stop = max(current_stop, entry_price, trailing_candidate)
+        return new_stop, best_favorable
+
+    if direction == "SELL":
+        best_favorable = min(best_price, current_price)
+        profit_distance = entry_price - best_favorable
+        if profit_distance < arm_r * risk_distance:
+            return current_stop, best_favorable
+        trailing_candidate = best_favorable + trail_gap_r * risk_distance
+        new_stop = min(current_stop, entry_price, trailing_candidate)
+        return new_stop, best_favorable
+
+    return current_stop, best_price
 
 
 # ── Indicator helpers ──────────────────────────────────────────────────────────

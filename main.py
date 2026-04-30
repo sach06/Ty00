@@ -39,7 +39,7 @@ import news_sentiment
 import runtime_settings
 from capital_client import CapitalClient
 from risk_manager import RiskManager
-from strategy import generate_signal
+from strategy import generate_signal, update_trailing_stop
 from rl_agent import RLAgent
 
 # ── Initialise logging before anything else ───────────────────────────────────
@@ -110,7 +110,7 @@ def _discover_top_cryptos(client: CapitalClient, limit: int = 5) -> list[str]:
 def _sync_positions(client: CapitalClient, tracked: dict) -> tuple[dict, list]:
     """
     Compare our tracked positions with live Capital.com positions.
-    If a position we track has disappeared, it was closed by SL/TP.
+    If a position we track has disappeared, it was closed externally.
     Returns (updated_tracked, closed_positions) where closed_positions is a
     list of (epic, pos_dict) tuples for externally closed positions.
     """
@@ -128,9 +128,8 @@ def _sync_positions(client: CapitalClient, tracked: dict) -> tuple[dict, list]:
         if pos.get("dry_run"):
             continue  # dry-run positions are managed locally
         if pos["deal_id"] not in live_ids:
-            # Closed externally (SL or TP hit)
             logger.info(
-                "%s: position %s no longer live (SL/TP hit or closed externally)",
+                "%s: position %s no longer live (closed externally)",
                 epic, pos["deal_id"],
             )
             closed.append((epic, pos))
@@ -215,15 +214,8 @@ def run():
                         continue
                     market = client.get_market_info(epic)
                     current_mid = _mid(market) if market else pos["entry"]
-                    direction_sign = 1 if pos["direction"] == "BUY" else -1
-                    pnl_pct = direction_sign * (current_mid - pos["entry"])
-                    # Determine whether SL or TP was more likely hit
-                    if pnl_pct >= 0:
-                        pnl_est = client.estimate_pnl(epic, pos["direction"], pos["entry"], pos["tp"], pos["size"], market=market)
-                        close_reason = "tp_hit"
-                    else:
-                        pnl_est = client.estimate_pnl(epic, pos["direction"], pos["entry"], pos["stop"], pos["size"], market=market)
-                        close_reason = "sl_hit"
+                    pnl_est = client.estimate_pnl(epic, pos["direction"], pos["entry"], current_mid, pos["size"], market=market)
+                    close_reason = "extern_profit_close" if pnl_est >= 0 else "sl_hit"
                     logger.info(
                         "%s: RL update (extern close %s) | pnl_est=%.2f EUR",
                         epic, close_reason, pnl_est,
@@ -286,11 +278,52 @@ def run():
                 # ── Check time stop on open position ─────────────────────────
                 if epic in tracked:
                     pos = tracked[epic]
+                    market = client.get_market_info(epic)
+                    current_mid = _mid(market) if market else pos["entry"]
+                    previous_stop = pos["stop"]
+                    pos["stop"], pos["best_price"] = update_trailing_stop(
+                        pos["direction"],
+                        pos["entry"],
+                        pos.get("initial_stop", pos["stop"]),
+                        pos["stop"],
+                        pos.get("best_price", pos["entry"]),
+                        current_mid,
+                    )
+                    if abs(pos["stop"] - previous_stop) > 1e-9:
+                        logger.info(
+                            "%s: trailing stop moved %.5f -> %.5f | price=%.5f",
+                            epic, previous_stop, pos["stop"], current_mid,
+                        )
+
+                    stop_hit = (
+                        (pos["direction"] == "BUY" and current_mid <= pos["stop"])
+                        or (pos["direction"] == "SELL" and current_mid >= pos["stop"])
+                    )
+                    if stop_hit:
+                        pnl_est = client.estimate_pnl(epic, pos["direction"], pos["entry"], current_mid, pos["size"], market=market)
+                        close_reason = "trailing_stop_hit" if abs(pos["stop"] - pos.get("initial_stop", pos["stop"])) > 1e-9 else "sl_hit"
+                        logger.info(
+                            "%s: %s → closing | est P&L=%.2f EUR",
+                            epic, close_reason, pnl_est,
+                        )
+                        if not dry_run and not pos.get("dry_run"):
+                            client.close_position(pos["deal_id"])
+                        risk.record_trade_result(pnl_est)
+                        if "rl_state" in pos:
+                            rl_agent.update(
+                                pos["rl_state"], pos["rl_action"],
+                                pnl_est, pos.get("rl_risk", 1.0),
+                            )
+                        state_writer.append_trade(
+                            epic, pos["direction"], pos["entry"],
+                            current_mid, pos["size"], pnl_est, close_reason,
+                        )
+                        tracked.pop(epic)
+                        continue
+
                     age_hours = (time.time() - pos["opened_at"]) / 3600
 
                     if age_hours >= config.TIME_STOP_HOURS:
-                        market = client.get_market_info(epic)
-                        current_mid = _mid(market) if market else pos["entry"]
                         pnl_est = client.estimate_pnl(epic, pos["direction"], pos["entry"], current_mid, pos["size"], market=market)
                         logger.info(
                             "%s: time stop (%.1f h) → closing | est P&L=%.2f EUR",
@@ -367,7 +400,7 @@ def run():
                 if order_size <= 0:
                     continue
                 if client.size_uses_units(epic, market=market):
-                    max_size = 50_000.0
+                    max_size = 2_000.0
                 else:
                     max_size = 10.0
                 if order_size > max_size:
@@ -380,9 +413,9 @@ def run():
                     )
 
                 logger.info(
-                    "%s SIGNAL ► %s | entry~%.5f | SL=%.5f | TP=%.5f | size=%.5f | %s",
+                    "%s SIGNAL ► %s | entry~%.5f | SL=%.5f | TSL=armed@+0.5R gap=0.5R | size=%.5f | %s",
                     epic, signal.direction, signal.entry_price,
-                    signal.stop_loss, signal.take_profit, order_size, signal.reason,
+                    signal.stop_loss, order_size, signal.reason,
                 )
 
                 # Approximate EUR risk for this trade (used by RL reward normalisation)
@@ -397,7 +430,9 @@ def run():
                         "direction": signal.direction,
                         "entry":     mid,
                         "stop":      signal.stop_loss,
+                        "initial_stop": signal.stop_loss,
                         "tp":        signal.take_profit,
+                        "best_price": mid,
                         "size":      order_size,
                         "exposure_units": exposure_units,
                         "opened_at": time.time(),
@@ -409,7 +444,7 @@ def run():
                 else:
                     result, status = client.open_position(
                         epic, signal.direction, order_size,
-                        signal.stop_loss, signal.take_profit,
+                        signal.stop_loss,
                     )
                     if status in (200, 201) and result:
                         deal_ref = result.get("dealReference", "unknown")
@@ -428,7 +463,9 @@ def run():
                             "direction": signal.direction,
                             "entry":     mid,
                             "stop":      signal.stop_loss,
+                            "initial_stop": signal.stop_loss,
                             "tp":        signal.take_profit,
+                            "best_price": mid,
                             "size":      order_size,
                             "exposure_units": exposure_units,
                             "opened_at": time.time(),
@@ -450,7 +487,7 @@ def run():
                             )
                             retry_result, retry_status = client.open_position(
                                 epic, signal.direction, retry_size,
-                                signal.stop_loss, signal.take_profit,
+                                signal.stop_loss,
                             )
                             if retry_status in (200, 201) and retry_result:
                                 deal_ref = retry_result.get("dealReference", "unknown")
@@ -460,7 +497,9 @@ def run():
                                     "direction": signal.direction,
                                     "entry":     mid,
                                     "stop":      signal.stop_loss,
+                                    "initial_stop": signal.stop_loss,
                                     "tp":        signal.take_profit,
+                                    "best_price": mid,
                                     "size":      retry_size,
                                     "exposure_units": client.size_to_exposure_units(epic, retry_size, market=market),
                                     "opened_at": time.time(),
