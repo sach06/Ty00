@@ -75,8 +75,8 @@ N_ACTIONS     = len(PARAM_VARIANTS)
 UCB_C         = math.sqrt(2)        # exploration constant (≈1.414)
 REWARD_CLIP   = (-3.0, 4.0)         # clip normalised rewards
 RL_STATE_FILE = "rl_state.json"
-SAFE_ACTIONS = [0, 1, 4, 8, 11]
-AGGRESSIVE_ACTIONS = [6, 9, 10]
+SAFE_ACTIONS = [0, 1, 4, 8, 9, 11]
+AGGRESSIVE_ACTIONS = [6, 10]
 
 
 class RLAgent:

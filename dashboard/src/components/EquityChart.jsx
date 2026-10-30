@@ -22,7 +22,7 @@ export default function EquityChart({ history = [] }) {
           </defs>
           <YAxis domain={domain} hide />
           <Tooltip
-            contentStyle={{ background: '#1e293b', border: '1px solid #334155', borderRadius: 8, fontSize: 11 }}
+            contentStyle={{ background: 'var(--tooltip-bg)', color: 'var(--ink)', border: '1px solid var(--line)', borderRadius: 8, fontSize: 11 }}
             labelFormatter={(_, payload) => payload?.[0]?.payload?.t?.slice(11, 19) + ' UTC'}
             formatter={(v) => [`€${v.toFixed(2)}`, 'Equity']}
           />

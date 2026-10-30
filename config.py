@@ -22,7 +22,13 @@ BASE_URL = (
 # ── Safety flags ───────────────────────────────────────────────────────────────
 # DRY_RUN=true → signals are computed and logged but NO orders are submitted
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
-
+# Optional external data sources for sentiment aggregation
+TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN", "")
+NEWSAPI_KEY          = os.getenv("NEWSAPI_KEY", "")
+FINNHUB_API_KEY      = os.getenv("FINNHUB_API_KEY", "")
+ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
+SENTIMENT_CALENDAR_DAYS = int(os.getenv("SENTIMENT_CALENDAR_DAYS", "3"))
+NEWSAPI_PAGE_SIZE    = int(os.getenv("NEWSAPI_PAGE_SIZE", "15"))
 # ── Account ────────────────────────────────────────────────────────────────────
 INITIAL_BALANCE    = float(os.getenv("INITIAL_BALANCE", "300"))
 # Only trade with this amount – the rest of the account equity is untouched.
@@ -31,10 +37,11 @@ TRADING_BUDGET     = float(os.getenv("TRADING_BUDGET", "200.0"))
 
 # ── Risk controls (never change these without understanding the maths) ─────────
 RISK_PER_TRADE_PCT  = 0.01   # 1 % of live equity per trade
-MAX_DAILY_LOSS_PCT  = 0.02   # 2 % daily loss → halt for the day
+MAX_DAILY_LOSS_PCT  = 0.02   # 2 % daily loss → halt for the day (percentage fallback)
+MAX_DAILY_LOSS_EUR  = 10.0   # absolute daily loss cap in EUR (takes precedence)
 MAX_DRAWDOWN_PCT    = 0.07   # 7 % drawdown from equity peak → kill switch
 MAX_CONSEC_LOSSES   = 3      # pause after N consecutive losing trades
-MAX_SPREAD_PIPS     = 3.0    # skip entry if spread > this many pips
+MAX_SPREAD_PIPS     = 6.5    # skip entry if spread > this many pips
 
 # ── Strategy parameters ────────────────────────────────────────────────────────
 RSI_PERIOD      = 14
@@ -56,6 +63,21 @@ INSTRUMENTS = ["EURUSD", "GBPUSD"]
 #                         to 22:00 UTC (NYSE close + 1 h wind-down)
 SESSION_START_HOUR = int(os.getenv("SESSION_START_HOUR", "13"))  # 09:00 ET
 SESSION_END_HOUR   = int(os.getenv("SESSION_END_HOUR",   "22"))  # 18:00 ET
+
+# ── US Tech 100 (Nasdaq 100) NY session agent ─────────────────────────────────
+US_TECH_CONFIG = {
+    "epic":              "US100",
+    "strategy_type":     "trend_breakout",  # distinct from the FX mean-reversion strategy
+    "ny_session_start":  (9,  30),           # (hour, minute) America/New_York
+    "ny_session_end":    (16,  0),           # (hour, minute) America/New_York
+    "max_spread_pts":    2.5,               # maximum index-point spread
+    "base_risk_eur":     3.0,               # doubled vs FX to capture larger index moves
+    "tp_ratio":          2.5,               # 2.5R take-profit target
+    "stop_atr_mult":     1.5,               # 1.5×ATR initial stop
+    "candle_resolution": "MINUTE_5",
+    "candle_count":      120,               # ~10 hours of 5-min bars
+    "time_stop_hours":   4,                 # force-close after 4 hours
+}
 
 # ── Loop timing ───────────────────────────────────────────────────────────────
 POLL_INTERVAL = 60        # seconds between main-loop ticks

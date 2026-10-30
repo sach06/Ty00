@@ -25,6 +25,7 @@ Usage
 
 import argparse
 import logging
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -48,9 +49,9 @@ logger = logging.getLogger("sprint")
 # ── Sprint-specific constants ────────────────────────────────────────────────
 POLL_SECS         = 15        # tick every 15 seconds
 CANDLE_RESOLUTION = "MINUTE_5" # 5-minute candles – less noise / spread impact than 1-min
-CANDLE_COUNT      = 80        # ~6.5 hours of 5-min bars (sufficient for all indicators)
-RSI_OS            = 35        # tighter entry – only act on genuine oversold
-RSI_OB            = 65        # tighter entry – only act on genuine overbought
+CANDLE_COUNT      = 100       # ~8.3 hours of 5-min bars for more stable ATR/BB/RSI warmup
+RSI_OS            = 38        # relaxed from 35 – captures ranging market extremes
+RSI_OB            = 62        # relaxed from 65 – captures ranging market extremes
 BB_STD            = 2.0       # fixed – not tuned by RL to avoid overfitting
 STOP_MULT         = 1.5       # fixed – 1.5×ATR initial stop
 TP_RR             = 2.0
@@ -60,11 +61,18 @@ MAX_LOSS_PCT      = 0.03      # 3% of budget = €1.50 daily halt
 MAX_DD_PCT        = 0.05      # 5% equity drawdown = kill
 TRAIL_ARM_R       = 1.0       # arm trailing stop after +1R (1.5×ATR) profit
 TRAIL_GAP_R       = 1.0       # trail 1R (≈1.5×ATR) behind best price
-CORR_THRESHOLD    = 0.75      # max allowed EURUSD/GBPUSD correlation before halving risk
+CORR_THRESHOLD    = 0.85      # max allowed EURUSD/GBPUSD correlation before halving risk
 CORR_BARS         = 60        # bars used for rolling correlation check
-INSTRUMENTS       = ["EURUSD", "GBPUSD"]
+INSTRUMENTS       = ["EURUSD", "GBPUSD", "OIL_CRUDE"]
 CRYPTO_CANDIDATES = ["BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD", "DOGEUSD", "BNBUSD", "LTCUSD", "ADAUSD"]
+SPRINT_LOCK_FILE  = os.path.join(os.path.dirname(__file__), "sprint.lock")
 FX_REJECT_SWITCH_THRESHOLD = 5
+REJECT_COOLDOWN_SECS       = 300  # 5-minute penalty box after broker REJECTED
+RELAX_AFTER_NO_ENTRY_TICKS = 30
+RELAX_RSI_OS_FX            = 42.0
+RELAX_RSI_OB_FX            = 58.0
+RELAX_RSI_OS_COMM          = 42.0
+RELAX_RSI_OB_COMM          = 58.0
 
 
 def _mid(market: dict) -> float:
@@ -162,7 +170,7 @@ def get_signal(
 ) -> Signal:
     """Signal generation on 5-min bars.  rsi_os/rsi_ob may be overridden by RL.
     BB_STD and STOP_MULT are intentionally fixed to prevent RL overfitting."""
-    if len(df) < 30:
+    if df.empty or len(df) < 30:
         return Signal("NONE", mid, 0, 0, 0, 0, f"need ≥30 bars, have {len(df)}")
 
     closes = df["close"]
@@ -176,17 +184,27 @@ def get_signal(
     curr_upper = upper_bb.iloc[-1]
     curr_atr   = atr_s.iloc[-1]
 
-    if any(pd.isna(v) for v in [curr_rsi, curr_lower, curr_upper, curr_atr]) or curr_atr == 0:
+    if any(pd.isna(v) for v in [curr_rsi, curr_lower, curr_upper, curr_atr]) or not np.isfinite(curr_atr) or curr_atr <= 0:
         return Signal("NONE", mid, 0, 0, 0, curr_rsi or 0, "indicators not ready")
 
     stop_d = curr_atr * STOP_MULT
     tp_d   = stop_d * TP_RR
 
+    # EMA trend filter – don't fight a confirmed directional trend with a mean-reversion entry
+    ema10 = closes.ewm(span=10, adjust=False).mean()
+    ema30 = closes.ewm(span=30, adjust=False).mean()
+    ema10_now, ema10_prev, ema30_now = ema10.iloc[-1], ema10.iloc[-4], ema30.iloc[-1]
+    trend_bearish = ema10_now < ema30_now and ema10_now < ema10_prev
+    trend_bullish = ema10_now > ema30_now and ema10_now > ema10_prev
+
     # Require both RSI extreme AND price at/near the band (no "or" — stricter entry)
-    near_lower = curr_close <= curr_lower * 1.0003
-    near_upper = curr_close >= curr_upper * 0.9997
+    near_lower = curr_close <= curr_lower * 1.001
+    near_upper = curr_close >= curr_upper * 0.999
 
     if curr_rsi <= rsi_os and near_lower:
+        if trend_bearish:
+            return Signal("NONE", mid, 0, 0, 0, curr_rsi,
+                          f"BUY suppressed: EMA10={ema10_now:.5f}<EMA30={ema30_now:.5f} slope↓")
         if sentiment <= -0.65:
             return Signal("NONE", mid, 0, 0, 0, curr_rsi,
                           f"BUY suppressed: bearish sentiment={sentiment:.2f}")
@@ -194,6 +212,9 @@ def get_signal(
                       f"BUY RSI={curr_rsi:.1f}≤{rsi_os} & nearLowerBB | sent={sentiment:+.2f}")
 
     if curr_rsi >= rsi_ob and near_upper:
+        if trend_bullish:
+            return Signal("NONE", mid, 0, 0, 0, curr_rsi,
+                          f"SELL suppressed: EMA10={ema10_now:.5f}>EMA30={ema30_now:.5f} slope↑")
         if sentiment >= 0.65:
             return Signal("NONE", mid, 0, 0, 0, curr_rsi,
                           f"SELL suppressed: bullish sentiment={sentiment:.2f}")
@@ -203,13 +224,87 @@ def get_signal(
     return Signal("NONE", mid, 0, 0, 0, curr_rsi, f"RSI={curr_rsi:.1f} – no extreme")
 
 
-def sprint(minutes: int, dry: bool):
+def get_signal_commodity(
+    df: pd.DataFrame,
+    mid: float,
+    sentiment: float,
+    rsi_os: float = 30.0,
+    rsi_ob: float = 70.0,
+) -> Signal:
+    """Separate mean-reversion strategy for commodities (e.g. OIL_CRUDE).
+    Uses wider RSI thresholds and looser BB proximity to account for
+    higher volatility and wider natural price swings."""
+    if df.empty or len(df) < 30:
+        return Signal("NONE", mid, 0, 0, 0, 0, f"need ≥30 bars, have {len(df)}")
+
+    closes = df["close"]
+    rsi_s               = _rsi(closes, 14)
+    upper_bb, _, lower_bb = _bollinger(closes, 20, BB_STD)
+    atr_s               = _atr(df["high"], df["low"], closes, 14)
+
+    curr_rsi   = rsi_s.iloc[-1]
+    curr_close = closes.iloc[-1]
+    curr_lower = lower_bb.iloc[-1]
+    curr_upper = upper_bb.iloc[-1]
+    curr_atr   = atr_s.iloc[-1]
+
+    if any(pd.isna(v) for v in [curr_rsi, curr_lower, curr_upper, curr_atr]) or not np.isfinite(curr_atr) or curr_atr <= 0:
+        return Signal("NONE", mid, 0, 0, 0, curr_rsi or 0, "indicators not ready")
+
+    stop_d = curr_atr * STOP_MULT
+    tp_d   = stop_d * TP_RR
+
+    # EMA trend filter – refuse to catch a falling knife or short into a rising commodity
+    ema10 = closes.ewm(span=10, adjust=False).mean()
+    ema30 = closes.ewm(span=30, adjust=False).mean()
+    ema10_now, ema10_prev, ema30_now = ema10.iloc[-1], ema10.iloc[-4], ema30.iloc[-1]
+    trend_bearish = ema10_now < ema30_now and ema10_now < ema10_prev
+    trend_bullish = ema10_now > ema30_now and ema10_now > ema10_prev
+
+    # Wider proximity for commodities: within 0.1% of band vs 0.03% for FX
+    near_lower = curr_close <= curr_lower * 1.001
+    near_upper = curr_close >= curr_upper * 0.999
+
+    if curr_rsi <= rsi_os and near_lower:
+        if trend_bearish:
+            return Signal("NONE", mid, 0, 0, 0, curr_rsi,
+                          f"COMM BUY suppressed: EMA10={ema10_now:.2f}<EMA30={ema30_now:.2f} slope↓")
+        # For commodities sentiment suppression threshold is looser (energy can be sentiment-driven)
+        if sentiment <= -0.5:
+            return Signal("NONE", mid, 0, 0, 0, curr_rsi,
+                          f"BUY suppressed: bearish sentiment={sentiment:.2f}")
+        return Signal("BUY", mid, mid - stop_d, mid + tp_d, curr_atr, curr_rsi,
+                      f"COMM BUY RSI={curr_rsi:.1f}≤{rsi_os:.1f} & nearLowerBB | sent={sentiment:+.2f}")
+
+    if curr_rsi >= rsi_ob and near_upper:
+        if trend_bullish:
+            return Signal("NONE", mid, 0, 0, 0, curr_rsi,
+                          f"COMM SELL suppressed: EMA10={ema10_now:.2f}>EMA30={ema30_now:.2f} slope↑")
+        if sentiment >= 0.5:
+            return Signal("NONE", mid, 0, 0, 0, curr_rsi,
+                          f"SELL suppressed: bullish sentiment={sentiment:.2f}")
+        return Signal("SELL", mid, mid + stop_d, mid - tp_d, curr_atr, curr_rsi,
+                      f"COMM SELL RSI={curr_rsi:.1f}≥{rsi_ob:.1f} & nearUpperBB | sent={sentiment:+.2f}")
+
+    return Signal("NONE", mid, 0, 0, 0, curr_rsi, f"RSI={curr_rsi:.1f} – no extreme")
+
+
+def sprint(minutes: int, dry: bool, instruments: list[str] | None = None):
     end_ts  = time.time() + minutes * 60
+    active_epics = instruments if instruments else list(INSTRUMENTS)
     start_budget = runtime_settings.get_budget(config.TRADING_BUDGET if config.TRADING_BUDGET > 0 else SPRINT_BUDGET)
     logger.warning(
         "═══ SPRINT START ═══ %d minutes | budget=€%.0f | dry=%s | instruments=%s",
-        minutes, start_budget, dry, INSTRUMENTS,
+        minutes, start_budget, dry, active_epics,
     )
+
+    # Write lock file so main.py knows to stand down
+    try:
+        with open(SPRINT_LOCK_FILE, "w") as _lf:
+            _lf.write(str(int(time.time())))
+        logger.info("Sprint lock file written: %s", SPRINT_LOCK_FILE)
+    except OSError as exc:
+        logger.warning("Could not write sprint lock file: %s", exc)
 
     client = CapitalClient()
     if not client.authenticate():
@@ -221,11 +316,16 @@ def sprint(minutes: int, dry: bool):
     risk.budget = start_budget
     rl        = RLAgent()
     tracked   : dict[str, dict] = {}
-    active_instruments = list(INSTRUMENTS)
+    active_instruments = list(active_epics)
     fx_size_rejects = 0
     sentiments: dict[str, float] = {}
+    _sentiment_last_fetch: float = 0.0
+    _SENTIMENT_INTERVAL   = 600  # 10 min – matches Capital.com /clientsentiment rate budget
+    penalty_box: dict[str, float] = {}   # epic -> unlock_timestamp (cleared on restart)
+    per_epic_loss_streak: dict[str, int] = {}  # consecutive SL hits per instrument
     sprint_pnl = 0.0
     tick_n     = 0
+    no_entry_ticks = 0
 
     logger.info("Balance: €%.2f | RL states loaded: %d", balance, len(rl.Q))
 
@@ -235,6 +335,16 @@ def sprint(minutes: int, dry: bool):
         now_utc   = datetime.now(timezone.utc)
         logger.info("── sprint tick %d | ⏱ %02d:%02d remaining ──",
                     tick_n, remaining // 60, remaining % 60)
+        relax_mode = no_entry_ticks >= RELAX_AFTER_NO_ENTRY_TICKS and len(tracked) == 0
+        if relax_mode:
+            logger.info(
+                "No entries for %d ticks: relax mode enabled (FX RSI %.0f/%.0f, COMM RSI %.0f/%.0f)",
+                no_entry_ticks,
+                RELAX_RSI_OS_FX,
+                RELAX_RSI_OB_FX,
+                RELAX_RSI_OS_COMM,
+                RELAX_RSI_OB_COMM,
+            )
 
         # ── Re-auth if needed ──────────────────────────────────────────────
         client._ensure_session()
@@ -248,11 +358,13 @@ def sprint(minutes: int, dry: bool):
         live_bal = _fetch_balance(client, risk.equity)
         risk.update_equity(live_bal)
 
-        # ── Sentiment (cached 5 min) ───────────────────────────────────────
-        try:
-            sentiments = news_sentiment.get_all_sentiments(active_instruments, client)
-        except Exception as exc:
-            logger.debug("Sentiment error: %s", exc)
+        # ── Sentiment (every 10 min – Capital.com /clientsentiment rate budget) ─
+        if time.time() - _sentiment_last_fetch >= _SENTIMENT_INTERVAL:
+            try:
+                sentiments = news_sentiment.get_all_sentiments(active_instruments, client)
+                _sentiment_last_fetch = time.time()
+            except Exception as exc:
+                logger.debug("Sentiment error: %s", exc)
 
         # ── Write dashboard state ──────────────────────────────────────────
         state_writer.write_state(risk, tracked, dry, sentiments,
@@ -279,6 +391,17 @@ def sprint(minutes: int, dry: bool):
                     why = "extern_profit_close" if pnl >= 0 else "sl_hit"
                     sprint_pnl += pnl
                     logger.info("%s: closed externally (%s) | pnl≈%+.2f EUR", epic, why, pnl)
+                    # Per-instrument SL streak: 2 consecutive hits → 5 min cooldown
+                    if why == "sl_hit":
+                        per_epic_loss_streak[epic] = per_epic_loss_streak.get(epic, 0) + 1
+                        if per_epic_loss_streak[epic] >= 2 and epic not in penalty_box:
+                            penalty_box[epic] = time.time() + REJECT_COOLDOWN_SECS
+                            logger.warning(
+                                "%s: %d consecutive SL hits – adding %ds cooldown",
+                                epic, per_epic_loss_streak[epic], REJECT_COOLDOWN_SECS,
+                            )
+                    else:
+                        per_epic_loss_streak[epic] = 0
                     if "rl_state" in pos:
                         rl.update(pos["rl_state"], pos["rl_action"], pnl, pos.get("rl_risk", 1.0))
                     risk.record_trade_result(pnl)
@@ -304,20 +427,30 @@ def sprint(minutes: int, dry: bool):
             if _p:
                 price_cache[_epic] = _p.get("prices", [])
 
-        # Correlation check: if EURUSD & GBPUSD are highly correlated (> CORR_THRESHOLD)
-        # halve the risk on any second simultaneous position to avoid double exposure.
+        # Correlation check: halve risk on GBPUSD when it is highly correlated with EURUSD.
+        # Crude oil is uncorrelated with FX so it is excluded from this check.
         corr_risk_factor: dict[str, float] = {e: 1.0 for e in active_instruments}
-        if len(active_instruments) == 2 and all(e in price_cache for e in active_instruments):
-            rho = _correlation(price_cache[active_instruments[0]], price_cache[active_instruments[1]])
+        fx_pair = [e for e in ["EURUSD", "GBPUSD"] if e in price_cache]
+        if len(fx_pair) == 2:
+            rho = _correlation(price_cache[fx_pair[0]], price_cache[fx_pair[1]])
             if abs(rho) > CORR_THRESHOLD:
                 logger.info(
-                    "Correlation ρ=%.2f > %.2f – halving risk on second instrument",
-                    rho, CORR_THRESHOLD,
+                    "Correlation ρ=%.2f > %.2f – halving risk on %s",
+                    rho, CORR_THRESHOLD, fx_pair[1],
                 )
-                # First instrument in list takes full risk; second takes 50%
-                corr_risk_factor[active_instruments[1]] = 0.5
+                corr_risk_factor[fx_pair[1]] = 0.5
 
         for epic in active_instruments:
+
+            # ── Penalty box (circuit breaker) ─────────────────────────────
+            if epic in penalty_box:
+                if time.time() < penalty_box[epic]:
+                    remaining_penalty = int(penalty_box[epic] - time.time())
+                    logger.info("%s: penalty box active – skipping for %ds", epic, remaining_penalty)
+                    continue
+                else:
+                    del penalty_box[epic]
+                    logger.info("%s: penalty box expired – instrument re-enabled", epic)
 
             # ── Time stop ─────────────────────────────────────────────────
             if epic in tracked:
@@ -387,11 +520,17 @@ def sprint(minutes: int, dry: bool):
             mid  = _mid(mkt)
             sprd = _spread(mkt)
 
-            # Spread check (use pip-equivalent: 1 pip = 0.0001 for FX)
-            sprd_pips = sprd / 0.0001
-            if sprd_pips > config.MAX_SPREAD_PIPS:
-                logger.info("%s: spread %.1f pips > %.1f max, skipping", epic, sprd_pips, config.MAX_SPREAD_PIPS)
-                continue
+            # Spread check: FX uses pip count (1 pip = 0.0001); non-FX uses % of price.
+            if _is_fx_epic(epic):
+                sprd_pips = sprd / 0.0001
+                if sprd_pips > config.MAX_SPREAD_PIPS:
+                    logger.info("%s: spread %.1f pips > %.1f max, skipping", epic, sprd_pips, config.MAX_SPREAD_PIPS)
+                    continue
+            else:
+                sprd_pct = (sprd / mid * 100) if mid > 0 else 999
+                if sprd_pct > 0.15:   # 0.15% max for commodities
+                    logger.info("%s: spread %.3f%% > 0.15%% max, skipping", epic, sprd_pct)
+                    continue
 
             # Use cached prices (already fetched for correlation check above)
             raw_prices = price_cache.get(epic)
@@ -407,7 +546,27 @@ def sprint(minutes: int, dry: bool):
                 epic, now_utc.hour, sent, 0.003,
                 consecutive_losses=risk.consecutive_losses,
             )
-            sig = get_signal(df, mid, sent, rsi_os=float(rl_params[0]), rsi_ob=float(rl_params[1]))
+            if _is_fx_epic(epic):
+                fx_rsi_os = float(rl_params[0])
+                fx_rsi_ob = float(rl_params[1])
+                if relax_mode:
+                    fx_rsi_os = max(fx_rsi_os, RELAX_RSI_OS_FX)
+                    fx_rsi_ob = min(fx_rsi_ob, RELAX_RSI_OB_FX)
+                sig = get_signal(df, mid, sent, rsi_os=fx_rsi_os, rsi_ob=fx_rsi_ob)
+            else:
+                # Keep commodity RSI in a safe corridor while allowing RL adaptation.
+                comm_rsi_os = max(25.0, min(40.0, float(rl_params[0])))
+                comm_rsi_ob = max(60.0, min(75.0, float(rl_params[1])))
+                if relax_mode:
+                    comm_rsi_os = max(comm_rsi_os, RELAX_RSI_OS_COMM)
+                    comm_rsi_ob = min(comm_rsi_ob, RELAX_RSI_OB_COMM)
+                sig = get_signal_commodity(
+                    df,
+                    mid,
+                    sent,
+                    rsi_os=comm_rsi_os,
+                    rsi_ob=comm_rsi_ob,
+                )
 
             if sig.direction == "NONE":
                 logger.info("%s: no signal | %s", epic, sig.reason)
@@ -427,6 +586,17 @@ def sprint(minutes: int, dry: bool):
             order_size = requested_size
             if order_size <= 0:
                 continue
+
+            # Broker minimum size guard: if risk-adjusted size is smaller than the
+            # broker minimum, skip the trade entirely. Bumping to minimum would mean
+            # trading far more than our risk limit allows (e.g. 0.01 -> 1600 = 160x).
+            if min_size > 0 and order_size < min_size:
+                logger.info(
+                    "%s: risk-adjusted size %.5f < broker minimum %.5f – skipping trade",
+                    epic, order_size, min_size,
+                )
+                continue
+
             if client.size_uses_units(epic, market=mkt):
                 # Cap FX unit size so margin per position stays within ~€90
                 # (account_balance / n_instruments / leverage * safety)
@@ -436,7 +606,9 @@ def sprint(minutes: int, dry: bool):
                 max_size = 1.0
             if order_size > max_size:
                 order_size = max_size
-                order_size, min_size, size_inc = client.normalize_order_size(epic, order_size, market=mkt)
+
+            # Always normalize after min/max adjustments so increment constraints are respected.
+            order_size, min_size, size_inc = client.normalize_order_size(epic, order_size, market=mkt)
             if abs(order_size - requested_size) > 1e-9:
                 logger.warning(
                     "%s: size capped %.5f -> %.5f (min=%.5f, inc=%.5f)",
@@ -470,6 +642,7 @@ def sprint(minutes: int, dry: bool):
                     "rl_action": rl_action,
                     "rl_risk":   rl_risk,
                 }
+                no_entry_ticks = 0
                 logger.info("%s: [DRY-RUN] position recorded", epic)
             else:
                 result, status = client.open_position(
@@ -483,7 +656,8 @@ def sprint(minutes: int, dry: bool):
                     confirm = client.confirm_deal(deal_ref)
                     if confirm:
                         deal_status = confirm.get("dealStatus", "UNKNOWN")
-                        reason      = confirm.get("reason", "")
+                        reason      = confirm.get("reason", "") or confirm.get("errorCode", "")
+                        error_code  = confirm.get("errorCode", "")
                         deal_id_confirmed = confirm.get("dealId", deal_ref)
                         if deal_status == "ACCEPTED":
                             logger.warning(
@@ -492,9 +666,21 @@ def sprint(minutes: int, dry: bool):
                             )
                         else:
                             logger.error(
-                                "%s: deal REJECTED by broker | status=%s | reason=%s | dealRef=%s",
-                                epic, deal_status, reason, deal_ref,
+                                "%s: deal REJECTED by broker | status=%s | reason=%s | errorCode=%s | dealRef=%s",
+                                epic, deal_status, reason, error_code, deal_ref,
                             )
+                            penalty_box[epic] = time.time() + REJECT_COOLDOWN_SECS
+                            logger.warning("%s: entering %ds penalty box after REJECTED confirm", epic, REJECT_COOLDOWN_SECS)
+                            # Global kill switch: if both FX pairs are penalised simultaneously,
+                            # it usually signals a high-impact USD news event (e.g. NFP/FOMC).
+                            fx_penalised = [e for e in ["EURUSD", "GBPUSD"]
+                                            if e in penalty_box and time.time() < penalty_box[e]]
+                            if len(fx_penalised) >= 2:
+                                logger.warning(
+                                    "Both FX instruments in penalty box (%s) – likely USD macro event. "
+                                    "FX trading paused for cooldown period.",
+                                    fx_penalised,
+                                )
                             continue  # skip tracking – order not live
                     else:
                         logger.warning("%s: could not confirm deal, assuming accepted | dealRef=%s", epic, deal_ref)
@@ -523,6 +709,7 @@ def sprint(minutes: int, dry: bool):
                         "rl_action": rl_action,
                         "rl_risk":   rl_risk,
                     }
+                    no_entry_ticks = 0
                 else:
                     code = (result or {}).get("errorCode", "") if isinstance(result, dict) else ""
                     if code == "error.invalid.size.minvalue":
@@ -530,33 +717,41 @@ def sprint(minutes: int, dry: bool):
                             fx_size_rejects += 1
                         bump = size_inc if size_inc > 0 else max(order_size * 0.1, 0.01)
                         retry_size = round(order_size + bump, 8)
-                        logger.warning(
-                            "%s: min-size reject at %.5f, retrying with %.5f",
-                            epic, order_size, retry_size,
-                        )
-                        retry_result, retry_status = client.open_position(
-                            epic, sig.direction, retry_size, sig.stop_loss,
-                        )
-                        if retry_status in (200, 201) and retry_result:
-                            deal_ref = retry_result.get("dealReference", "unknown")
-                            logger.info("%s: order submitted on retry | dealRef=%s", epic, deal_ref)
-                            tracked[epic] = {
-                                "deal_id":   deal_ref,
-                                "direction": sig.direction,
-                                "entry":     mid,
-                                "stop":      sig.stop_loss,
-                                "initial_stop": sig.stop_loss,
-                                "tp":        sig.take_profit,
-                                "best_price": mid,
-                                "size":      retry_size,
-                                "exposure_units": client.size_to_exposure_units(epic, retry_size, market=mkt),
-                                "opened_at": time.time(),
-                                "dry_run":   False,
-                                "rl_state":  rl_state,
-                                "rl_action": rl_action,
-                                "rl_risk":   max(stop_dist * client.size_to_exposure_units(epic, retry_size, market=mkt), 0.01),
-                            }
-                            continue
+                        retry_risk = stop_dist * client.size_to_exposure_units(epic, retry_size, market=mkt)
+                        if retry_risk <= risk_eur + 1e-9:
+                            logger.warning(
+                                "%s: min-size reject at %.5f, retrying with risk-checked size %.5f",
+                                epic, order_size, retry_size,
+                            )
+                            retry_result, retry_status = client.open_position(
+                                epic, sig.direction, retry_size, sig.stop_loss,
+                            )
+                            if retry_status in (200, 201) and retry_result:
+                                deal_ref = retry_result.get("dealReference", "unknown")
+                                logger.info("%s: order submitted on retry | dealRef=%s", epic, deal_ref)
+                                tracked[epic] = {
+                                    "deal_id":   deal_ref,
+                                    "direction": sig.direction,
+                                    "entry":     mid,
+                                    "stop":      sig.stop_loss,
+                                    "initial_stop": sig.stop_loss,
+                                    "tp":        sig.take_profit,
+                                    "best_price": mid,
+                                    "size":      retry_size,
+                                    "exposure_units": client.size_to_exposure_units(epic, retry_size, market=mkt),
+                                    "opened_at": time.time(),
+                                    "dry_run":   False,
+                                    "rl_state":  rl_state,
+                                    "rl_action": rl_action,
+                                    "rl_risk":   max(retry_risk, 0.01),
+                                }
+                                no_entry_ticks = 0
+                                continue
+                        else:
+                            logger.warning(
+                                "%s: broker minimum retry blocked; risk %.2f EUR exceeds %.2f EUR cap",
+                                epic, retry_risk, risk_eur,
+                            )
                         if fx_size_rejects >= FX_REJECT_SWITCH_THRESHOLD and all(_is_fx_epic(e) for e in active_instruments):
                             cryptos = _discover_top_cryptos(client, limit=5)
                             if cryptos:
@@ -570,6 +765,10 @@ def sprint(minutes: int, dry: bool):
 
         logger.info("Sprint P&L so far: %+.2f EUR | equity: %.2f EUR",
                     sprint_pnl, risk.equity)
+        if len(tracked) == 0:
+            no_entry_ticks += 1
+        else:
+            no_entry_ticks = 0
         time.sleep(POLL_SECS)
 
     # ── Sprint end: force-close all open positions ─────────────────────────
@@ -609,11 +808,20 @@ def sprint(minutes: int, dry: bool):
         rl.total_updates,
     )
 
+    # Remove lock file so main.py can resume
+    try:
+        os.remove(SPRINT_LOCK_FILE)
+        logger.info("Sprint lock file removed – main loop may resume")
+    except OSError:
+        pass
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="High-frequency 1-hour trading sprint")
-    parser.add_argument("--minutes", type=int, default=60, help="Sprint duration in minutes (default: 60)")
-    parser.add_argument("--dry",     action="store_true",  help="Paper mode – log signals but submit NO real orders")
+    parser.add_argument("--minutes",     type=int,   default=60,  help="Sprint duration in minutes (default: 60)")
+    parser.add_argument("--dry",         action="store_true",     help="Paper mode – log signals but submit NO real orders")
+    parser.add_argument("--instruments", nargs="+",  default=None,
+                        help="Epics to trade, e.g. EURUSD GBPUSD (default: all)")
     args = parser.parse_args()
 
-    sprint(args.minutes, args.dry)
+    sprint(args.minutes, args.dry, args.instruments)

@@ -24,13 +24,22 @@ function qColor(q) {
 }
 
 export default function RLPanel({ rl }) {
-  const [showAll, setShowAll] = useState(false)
+  const [showAll,    setShowAll]    = useState(false)
+  const [collapsed,  setCollapsed]  = useState(false)
 
   if (!rl || rl.total_updates === undefined) {
     return (
       <div className="bg-slate-800 border border-slate-700 rounded-xl p-4">
-        <h3 className="text-slate-400 text-sm font-medium mb-2">RL Agent</h3>
-        <p className="text-slate-500 text-xs">No trades learned yet — agent will self-improve after first close.</p>
+        <button
+          onClick={() => setCollapsed(v => !v)}
+          className="flex items-center justify-between w-full text-left"
+        >
+          <h3 className="text-slate-400 text-sm font-medium">RL Agent · Self-improving Strategy</h3>
+          <span className="text-slate-600 text-xs">{collapsed ? '▼' : '▲'}</span>
+        </button>
+        {!collapsed && (
+          <p className="mt-2 text-slate-500 text-xs">No trades learned yet — agent will self-improve after first close.</p>
+        )}
       </div>
     )
   }
@@ -41,12 +50,20 @@ export default function RLPanel({ rl }) {
 
   return (
     <div className="bg-slate-800 border border-slate-700 rounded-xl p-4 space-y-4">
-      {/* Header */}
-      <div className="flex items-center justify-between">
+      {/* Header – always visible, click to collapse */}
+      <button
+        onClick={() => setCollapsed(v => !v)}
+        className="flex items-center justify-between w-full text-left"
+      >
         <h3 className="text-slate-200 text-sm font-semibold">RL Agent · Self-improving Strategy</h3>
-        <span className="text-xs text-slate-500">{rl.total_updates} trades learned</span>
-      </div>
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-slate-500">{rl.total_updates} trades learned</span>
+          <span className="text-slate-500 text-xs">{collapsed ? '▼' : '▲'}</span>
+        </div>
+      </button>
 
+      {!collapsed && (
+        <>
       {/* Global best */}
       {rl.best_global_action && rl.total_updates > 0 && (
         <div className="bg-slate-700/50 rounded-lg px-3 py-2 flex items-center gap-3">
@@ -139,6 +156,8 @@ export default function RLPanel({ rl }) {
         <p className="text-slate-500 text-xs">
           Exploring all variants in round-robin until each has one trade. Then UCB1 exploitation begins.
         </p>
+      )}
+        </>
       )}
     </div>
   )

@@ -99,10 +99,18 @@ class RiskManager:
             logger.critical("KILL SWITCH: %s", reason)
             return True, reason
 
-        # Daily-loss check is relative to TRADING_BUDGET for tighter budget control
-        dl = abs(self._daily_pnl) / self.budget if self.budget > 0 else 0.0
-        if self._daily_pnl < 0 and dl >= config.MAX_DAILY_LOSS_PCT:
-            reason = f"Daily loss €{abs(self._daily_pnl):.2f} ≥ {config.MAX_DAILY_LOSS_PCT:.0%} of budget"
+        # Daily-loss check: use absolute EUR cap if configured, else fall back to % of budget
+        abs_loss = abs(self._daily_pnl)
+        eur_limit = getattr(config, 'MAX_DAILY_LOSS_EUR', None)
+        if eur_limit and eur_limit > 0:
+            hit = self._daily_pnl < 0 and abs_loss >= eur_limit
+            reason_detail = f"€{abs_loss:.2f} ≥ €{eur_limit:.2f} daily limit"
+        else:
+            dl = abs_loss / self.budget if self.budget > 0 else 0.0
+            hit = self._daily_pnl < 0 and dl >= config.MAX_DAILY_LOSS_PCT
+            reason_detail = f"€{abs_loss:.2f} ≥ {config.MAX_DAILY_LOSS_PCT:.0%} of budget"
+        if hit:
+            reason = f"Daily loss {reason_detail}"
             logger.warning("DAILY HALT: %s", reason)
             return True, reason
 

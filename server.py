@@ -23,6 +23,10 @@ from datetime import datetime, timezone
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
+# ── Sprint process registry ───────────────────────────────────────────────────
+# Keys: "fx" | "oil" | "crypto"
+_sprint_procs: dict[str, subprocess.Popen] = {}
+
 import config
 import runtime_settings
 from capital_client import CapitalClient
@@ -83,6 +87,21 @@ def _iso_age_hours(created_at: str | None) -> float:
         return round((datetime.now(timezone.utc) - created).total_seconds() / 3600, 2)
     except ValueError:
         return 0.0
+
+
+def _state_is_fresh(state: dict) -> bool:
+    updated_at = state.get("last_updated")
+    if not isinstance(updated_at, str) or not updated_at:
+        return False
+    try:
+        updated = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+
+    age_seconds = (datetime.now(timezone.utc) - updated).total_seconds()
+    return -30 <= age_seconds <= max(config.POLL_INTERVAL * 3, 180)
 
 
 def _fetch_live_positions() -> list[dict]:
@@ -233,8 +252,8 @@ def _compute_realized_pnl_from_transactions() -> dict:
 @app.route("/api/state")
 def api_state():
     state = _load_json_file("bot_state.json", None)
-    if state is None:
-        return jsonify({"error": "Bot not running or no state written yet."}), 503
+    if not isinstance(state, dict) or not _state_is_fresh(state):
+        return jsonify({"error": "Bot state is stale or unavailable; bot is not running."}), 503
 
     live_positions = _fetch_live_positions()
     logger.info(
@@ -313,7 +332,108 @@ def api_set_budget():
     return jsonify({"budget": new_budget, "status": "ok"})
 
 
-# ── Serve the production React build (after: cd dashboard && npm run build) ───
+@app.route("/api/countdown", methods=["GET"])
+def api_get_countdown():
+    """Return the current countdown as a Unix epoch (seconds)."""
+    return jsonify({"epoch": runtime_settings.get_countdown_epoch()})
+
+
+@app.route("/api/countdown", methods=["PUT"])
+def api_set_countdown():
+    """Update the countdown target time (HH:MM) → stores as next-occurrence epoch."""
+    data = request.get_json(silent=True) or {}
+    raw = str(data.get("target", "")).strip()
+    try:
+        h, m = raw.split(":")
+        h, m = int(h), int(m)
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError
+    except (ValueError, AttributeError):
+        return jsonify({"error": "target must be HH:MM (e.g. 18:40)"}), 400
+    hhmm = f"{h:02d}:{m:02d}"
+    epoch = runtime_settings._hhmm_to_next_epoch(hhmm)
+    runtime_settings.set_countdown_epoch(epoch)
+    return jsonify({"epoch": epoch, "target": hhmm, "status": "ok"})
+
+
+@app.route("/api/countdown/extend", methods=["POST"])
+def api_extend_countdown():
+    """Add 24 hours to the current countdown epoch."""
+    epoch = runtime_settings.get_countdown_epoch()
+    epoch += 86400.0
+    runtime_settings.set_countdown_epoch(epoch)
+    return jsonify({"epoch": epoch, "status": "ok"})
+
+
+
+@app.route("/api/sprint/status")
+def api_sprint_status():
+    """Return running state of all three sprint processes."""
+    out = {}
+    for key, proc in list(_sprint_procs.items()):
+        code = proc.poll()
+        out[key] = {"running": code is None, "exit_code": code}
+    for key in ("fx", "oil", "crypto"):
+        out.setdefault(key, {"running": False, "exit_code": None})
+    return jsonify(out)
+
+
+_SPRINT_CONFIGS = {
+    "fx":     {"script": "sprint.py",        "instruments": ["EURUSD", "GBPUSD"]},
+    "oil":    {"script": "sprint.py",        "instruments": ["OIL_CRUDE"]},
+    "crypto": {"script": "crypto_sprint.py", "instruments": None},
+}
+
+
+@app.route("/api/sprint/start", methods=["POST"])
+def api_sprint_start():
+    """Start a named sprint process if not already running."""
+    data   = request.get_json(silent=True) or {}
+    key    = data.get("sprint", "").lower()
+    if key not in _SPRINT_CONFIGS:
+        return jsonify({"error": f"Unknown sprint '{key}'. Use: fx, oil, crypto"}), 400
+
+    # Reap dead process if any
+    existing = _sprint_procs.get(key)
+    if existing and existing.poll() is None:
+        return jsonify({"status": "already_running", "sprint": key})
+
+    minutes = int(data.get("minutes", 120))
+    cfg     = _SPRINT_CONFIGS[key]
+    script  = os.path.join(os.path.dirname(__file__), cfg["script"])
+    cmd     = [sys.executable, script, "--minutes", str(minutes)]
+    if cfg["instruments"]:
+        cmd += ["--instruments"] + cfg["instruments"]
+
+    try:
+        proc = subprocess.Popen(cmd, cwd=os.path.dirname(__file__))
+        _sprint_procs[key] = proc
+        logger.info("Sprint '%s' started (pid=%d) cmd=%s", key, proc.pid, " ".join(cmd))
+        return jsonify({"status": "started", "sprint": key, "pid": proc.pid})
+    except OSError as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/sprint/stop", methods=["POST"])
+def api_sprint_stop():
+    """Stop a named sprint process."""
+    data = request.get_json(silent=True) or {}
+    key  = data.get("sprint", "").lower()
+    if key not in _SPRINT_CONFIGS:
+        return jsonify({"error": f"Unknown sprint '{key}'. Use: fx, oil, crypto"}), 400
+
+    proc = _sprint_procs.get(key)
+    if not proc or proc.poll() is not None:
+        return jsonify({"status": "not_running", "sprint": key})
+
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    logger.info("Sprint '%s' stopped (pid=%d)", key, proc.pid)
+    return jsonify({"status": "stopped", "sprint": key})
+
 
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")

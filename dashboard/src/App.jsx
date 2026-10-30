@@ -7,6 +7,8 @@ import EquityChart from './components/EquityChart'
 import BudgetPanel from './components/BudgetPanel'
 import SentimentPanel from './components/SentimentPanel'
 import RLPanel from './components/RLPanel'
+import CountdownPanel from './components/CountdownPanel'
+import SprintControlPanel from './components/SprintControlPanel'
 
 const STATE_POLL_MS  = 5_000
 const TRADES_POLL_MS = 10_000
@@ -14,8 +16,9 @@ const LOGS_POLL_MS   = 5_000
 
 async function fetchJSON(url) {
   const res = await fetch(url)
-  if (!res.ok) throw new Error(`${res.status}`)
-  return res.json()
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.error || `${res.status}`)
+  return data
 }
 
 export default function App() {
@@ -26,6 +29,16 @@ export default function App() {
   const [lastOk, setLastOk] = useState(null)
   const [now, setNow] = useState(new Date())
   const [realized, setRealized] = useState(null)
+  const [countdownEpoch, setCountdownEpoch] = useState(null)
+  const [theme, setTheme] = useState(() => {
+    const saved = localStorage.getItem('ty00-theme')
+    return saved === 'light' || saved === 'dark'
+      ? saved
+      : window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
+  })
+  const [username, setUsername] = useState(() => localStorage.getItem('ty00-username') || 'Trader')
+  const [nameDraft, setNameDraft] = useState('')
+  const [editingName, setEditingName] = useState(false)
 
   const loadState = useCallback(async () => {
     try {
@@ -35,7 +48,9 @@ export default function App() {
       setError(null)
       setLastOk(new Date())
     } catch (e) {
-      setError('Cannot reach API server (python server.py running?)')
+      setError(e instanceof Error && e.message !== 'Failed to fetch'
+        ? e.message
+        : 'Cannot reach API server (python server.py running?)')
     }
   }, [])
 
@@ -51,15 +66,27 @@ export default function App() {
     try { setRealized(await fetchJSON('/api/realized-pnl')) } catch {}
   }, [])
 
+  const loadCountdown = useCallback(async () => {
+    try {
+      const data = await fetchJSON('/api/countdown')
+      if (data.epoch != null) setCountdownEpoch(data.epoch)
+    } catch {}
+  }, [])
+
   useEffect(() => {
-    loadState();  loadTrades();  loadLogs(); loadRealized()
+    document.documentElement.dataset.theme = theme
+    localStorage.setItem('ty00-theme', theme)
+  }, [theme])
+
+  useEffect(() => {
+    loadState();  loadTrades();  loadLogs(); loadRealized(); loadCountdown()
     const t1 = setInterval(loadState,  STATE_POLL_MS)
     const t2 = setInterval(loadTrades, TRADES_POLL_MS)
     const t3 = setInterval(loadLogs,   LOGS_POLL_MS)
     const t5 = setInterval(loadRealized, STATE_POLL_MS)
     const t4 = setInterval(() => setNow(new Date()), 1000)
     return () => { clearInterval(t1); clearInterval(t2); clearInterval(t3); clearInterval(t4); clearInterval(t5) }
-  }, [loadState, loadTrades, loadLogs, loadRealized])
+  }, [loadState, loadTrades, loadLogs, loadRealized, loadCountdown])
 
   // ── Status badge ────────────────────────────────────────────────────────────
   const statusBadge = () => {
@@ -81,47 +108,113 @@ export default function App() {
   const realizedCount = Number(realized?.transaction_count ?? 0)
   const hasRealized = realized !== null && realizedCount > 0
 
-  const target14 = new Date(now)
-  target14.setHours(14, 0, 0, 0)
-  const countdownSec = Math.floor((target14.getTime() - now.getTime()) / 1000)
-  const isPastTarget = countdownSec < 0
-  const absSec = Math.abs(countdownSec)
-  const h = Math.floor(absSec / 3600)
-  const m = Math.floor((absSec % 3600) / 60)
-  const s = absSec % 60
-  const countdownLabel = `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
+  function saveUsername(event) {
+    event.preventDefault()
+    const nextName = nameDraft.trim().slice(0, 32)
+    if (nextName) {
+      setUsername(nextName)
+      localStorage.setItem('ty00-username', nextName)
+    }
+    setEditingName(false)
+  }
 
   const pnlColor  = pnl === null ? 'text-slate-100' : pnl >= 0 ? 'text-emerald-400' : 'text-red-400'
   const ddColor   = drawdown === null ? 'text-slate-100' : drawdown < 3 ? 'text-emerald-400' : drawdown < 6 ? 'text-yellow-400' : 'text-red-400'
 
   return (
-    <div className="min-h-screen bg-slate-900 p-4 lg:p-6">
-      {/* ── Header ── */}
-      <header className="flex flex-wrap items-center justify-between gap-3 mb-6">
-        <div className="flex items-center gap-3">
-          <span className="text-2xl font-semibold text-slate-100 tracking-tight">Ty00</span>
-          <span className="text-slate-600 text-lg">│</span>
-          <span className="text-slate-400 text-sm">Trading Dashboard</span>
-        </div>
-        <div className="flex items-center gap-4">
-          {statusBadge()}
-          {lastOk && (
-            <span className="text-xs text-slate-600">
-              Updated {lastOk.toLocaleTimeString('en-GB', { hour12: false })}
+    <div className="app-shell" data-theme={theme}>
+      <header className="app-topbar">
+        <div className="topbar-inner">
+          <a className="brand-lockup" href="#overview" aria-label="Ty00 dashboard home">
+            <span className="brand-mark" aria-hidden="true">T</span>
+            <span className="brand-copy">
+              <strong>TY00</strong>
+              <small>TRADING DESK</small>
             </span>
-          )}
+          </a>
+
+          <div className="topbar-center">
+            {statusBadge()}
+            <span className="topbar-divider" />
+            <span className="connection-copy">
+              <span className={`connection-dot ${error ? 'is-offline' : state ? 'is-online' : ''}`} />
+              {lastOk
+                ? `Synced ${lastOk.toLocaleTimeString('en-GB', { hour12: false })}`
+                : error ? 'API unavailable' : 'Connecting'}
+            </span>
+          </div>
+
+          <div className="topbar-actions">
+            <div className="theme-switch" role="group" aria-label="Color theme">
+              <button
+                type="button"
+                aria-pressed={theme === 'light'}
+                onClick={() => setTheme('light')}
+              >Light</button>
+              <button
+                type="button"
+                aria-pressed={theme === 'dark'}
+                onClick={() => setTheme('dark')}
+              >Dark</button>
+            </div>
+            <div className="profile-area">
+              {editingName ? (
+                <form className="profile-edit" onSubmit={saveUsername}>
+                  <input
+                    aria-label="Display name"
+                    autoFocus
+                    maxLength={32}
+                    value={nameDraft}
+                    onChange={event => setNameDraft(event.target.value)}
+                  />
+                  <button type="submit" className="profile-save">Save</button>
+                  <button type="button" className="profile-cancel" onClick={() => setEditingName(false)}>Cancel</button>
+                </form>
+              ) : (
+                <>
+                  <span className="profile-avatar" aria-hidden="true">{username.slice(0, 1).toUpperCase()}</span>
+                  <span className="profile-copy">
+                    <strong>{username}</strong>
+                    <small>Local profile</small>
+                  </span>
+                  <button
+                    type="button"
+                    className="profile-edit-button"
+                    aria-label="Edit display name"
+                    title="Edit display name"
+                    onClick={() => { setNameDraft(username); setEditingName(true) }}
+                  >Edit</button>
+                </>
+              )}
+            </div>
+          </div>
         </div>
       </header>
 
-      {/* ── Error banner ── */}
-      {error && (
-        <div className="mb-4 bg-red-900/40 border border-red-700 rounded-lg px-4 py-3 text-red-300 text-sm">
-          {error}
+      <main id="overview" className="dashboard-content">
+        <div className="page-heading">
+          <div>
+            <p className="eyebrow">PORTFOLIO MONITOR</p>
+            <h1>Overview</h1>
+          </div>
+          <div className="market-clock">
+            <span className="market-clock-label">UTC</span>
+            <strong>{now.toLocaleTimeString('en-GB', { hour12: false })}</strong>
+            <span>{now.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'UTC' })}</span>
+          </div>
         </div>
-      )}
 
-      {/* ── Metric cards ── */}
-      <div className="grid grid-cols-2 lg:grid-cols-6 gap-3 mb-4">
+        {error && (
+          <div className="error-banner" role="alert">
+            <span className="error-indicator" aria-hidden="true">!</span>
+            <div>
+              <strong>Connection unavailable</strong>
+              <p>{error}</p>
+            </div>
+          </div>
+        )}
+
+        <section className="metric-grid" aria-label="Portfolio performance">
         <MetricCard
           label="Equity"
           value={state ? `€${equity.toFixed(2)}` : '—'}
@@ -146,65 +239,48 @@ export default function App() {
           sub={`${winTr} / ${totalTr} trades`}
         />
         <MetricCard
-          label="Countdown to 14:00"
-          value={isPastTarget ? `-${countdownLabel}` : countdownLabel}
-          color={isPastTarget ? 'text-red-400' : 'text-amber-300'}
-          sub={isPastTarget ? 'Target passed' : 'Local time'}
-        />
-        <MetricCard
           label="Realized P&L (Broker)"
           value={hasRealized ? `${realizedPnlToday >= 0 ? '+' : ''}€${realizedPnlToday.toFixed(2)}` : '—'}
           color={hasRealized ? (realizedPnlToday >= 0 ? 'text-emerald-400' : 'text-red-400') : 'text-slate-300'}
           sub={hasRealized ? `Today UTC · ${realizedCount} broker tx` : 'Broker did not return realized P&L yet'}
         />
-      </div>
+        </section>
 
-      {/* ── Equity chart ── */}
-      {state?.equity_history?.length > 1 && (
-        <div className="mb-4">
-          <EquityChart history={state.equity_history} />
+        <div className="workstation-grid">
+          <section className="workstation-main" aria-label="Positions and performance">
+            {state?.equity_history?.length > 1 && (
+              <EquityChart history={state.equity_history} />
+            )}
+            <PositionsTable positions={state?.open_positions ?? []} />
+            <TradesTable trades={trades} />
+          </section>
+
+          <aside className="workstation-side" aria-label="Trading controls and signals">
+            <BudgetPanel
+              budget={state?.budget ?? null}
+              used={state?.budget_used ?? 0}
+              available={state?.budget_available ?? (state?.budget ?? 0)}
+              onBudgetChange={newVal => setState(prev => prev ? {
+                ...prev,
+                budget: newVal,
+                budget_available: Math.max(0, newVal - (prev.budget_used ?? 0)),
+              } : prev)}
+            />
+            <SentimentPanel sentiment={state?.sentiment} />
+            <CountdownPanel epoch={countdownEpoch} onEpochChange={setCountdownEpoch} />
+            <SprintControlPanel />
+            <RLPanel rl={state?.rl} />
+          </aside>
         </div>
-      )}
 
-      {/* ── Budget + Sentiment row ── */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 mb-4">
-        <BudgetPanel
-          budget={state?.budget ?? null}
-          used={state?.budget_used ?? 0}
-          available={state?.budget_available ?? (state?.budget ?? 0)}
-          onBudgetChange={newVal => setState(prev => prev ? {
-            ...prev,
-            budget: newVal,
-            budget_available: Math.max(0, newVal - (prev.budget_used ?? 0)),
-          } : prev)}
-        />
-        <SentimentPanel sentiment={state?.sentiment} />
-      </div>
+        <LogFeed lines={logs} />
 
-      {/* ── RL Agent panel ── */}
-      <div className="mb-4">
-        <RLPanel rl={state?.rl} />
-      </div>
-
-      {/* ── Positions ── */}
-      <div className="mb-4">
-        <PositionsTable positions={state?.open_positions ?? []} />
-      </div>
-
-      {/* ── Trades ── */}
-      <div className="mb-4">
-        <TradesTable trades={trades} />
-      </div>
-
-      {/* ── Log feed ── */}
-      <LogFeed lines={logs} />
-
-      {/* ── Footer ── */}
-      <footer className="mt-4 text-xs text-slate-700 text-center">
-        Strategy: RSI(14) + Bollinger Bands(20,2σ) · Intraday only 08:00–16:00 UTC ·
-        Max drawdown 7% · Risk 1%/trade · Budget €{state?.budget?.toFixed(0) ?? '—'} ·
-        Sentiment-filtered signals
-      </footer>
+        <footer className="dashboard-footer">
+          <span>RSI(14) · Bollinger Bands(20, 2σ)</span>
+          <span>Session 08:00–16:00 UTC</span>
+          <span>Risk 1% / trade · Drawdown limit 7%</span>
+        </footer>
+      </main>
     </div>
   )
 }
@@ -219,7 +295,7 @@ function Badge({ color = 'slate', pulse = false, children }) {
     slate:   'bg-slate-700      text-slate-300   border-slate-600',
   }
   return (
-    <span className={`px-3 py-1 rounded-full text-xs font-semibold border ${colors[color]} ${pulse ? 'animate-pulse' : ''}`}>
+    <span className={`status-badge ${colors[color]} ${pulse ? 'animate-pulse' : ''}`}>
       {children}
     </span>
   )
